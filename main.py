@@ -22,6 +22,12 @@ for byte the same):
     sell the whole position.
   * Long and position value <= 9920/10000 of its cost (down 80 bps):
     sell the whole position.
+  * Long and held for 360 bars (6 hours) without reverting: sell the
+    whole position -- a dip that has not reverted in 6 hours is a stale
+    thesis, not a bargain.
+  * Flat and the 60-minute return is below -150 bps: do not buy the dip
+    at all -- that is a freefall, not a stretch. (On the dev window this
+    guard never fires, so it costs nothing there; it exists for the race.)
   * Every order caps its slippage at 100 bps from the latest close, so a
     fill that jumps far past the close is refused and retried next bar
     instead of chased.
@@ -55,11 +61,17 @@ WINDOW = 240
 DIP_BPS = 80
 TAKE_BPS = 80
 STOP_BPS = 80
+# Do not buy into a 60-minute fall steeper than 150 bps (freefall guard).
+KNIFE_BPS = 150
+# Give up on a position that has not reverted after 360 bars (6 hours).
+MAX_HOLD_BARS = 360
 # Refuse a fill that moved more than 100 bps from the close we decided on.
 MAX_SLIPPAGE_BPS = 100
 
 _closes = deque(maxlen=WINDOW)
 _sum = 0
+# Batches the current position has been held (0 while flat).
+_held_bars = 0
 
 
 def _push(close):
@@ -71,6 +83,7 @@ def _push(close):
 
 
 def on_batch(state, batch):
+    global _held_bars
     for bar in batch["bars"]:
         if bar["symbol"] == SYMBOL:
             _push(int(bar["c"]))
@@ -79,13 +92,17 @@ def on_batch(state, batch):
     close = _closes[-1]
     held = state.positions.get(SYMBOL)
     if held is not None:
+        _held_bars += 1
         value = state.value(SYMBOL, held.qty)
-        # Reverted to the average, or take-profit, or stop-loss: exit whole.
+        # Reverted to the average, or take-profit, or stop-loss, or the
+        # thesis is stale after 6 hours: exit whole.
         if (
             close * WINDOW >= _sum
             or value * 10000 >= held.cost * (10000 + TAKE_BPS)
             or value * 10000 <= held.cost * (10000 - STOP_BPS)
+            or _held_bars >= MAX_HOLD_BARS
         ):
+            _held_bars = 0
             return [
                 {
                     "side": "sell",
@@ -95,8 +112,13 @@ def on_batch(state, batch):
                 }
             ]
         return []
-    # Flat and stretched 80 bps or more below the slow average: buy it all.
+    _held_bars = 0
+    # Flat and stretched 80 bps or more below the slow average: buy it
+    # all -- unless the last hour fell off a cliff (freefall guard).
     if close * WINDOW * 10000 < _sum * (10000 - DIP_BPS):
+        hour_ago = _closes[-61]
+        if close * 10000 < hour_ago * (10000 - KNIFE_BPS):
+            return []
         return [
             {
                 "side": "buy",
